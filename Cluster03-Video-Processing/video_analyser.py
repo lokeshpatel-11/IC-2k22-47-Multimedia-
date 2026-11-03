@@ -1,190 +1,264 @@
 import os
 import json
-import subprocess
 import shutil
+import subprocess
 from pathlib import Path
 
 
-def format_file_size(size_in_bytes):
-    """Convert bytes into readable file size."""
-    size = float(size_in_bytes)
-    units = ["Bytes", "KB", "MB", "GB", "TB"]
-    for unit in units:
+def format_size(size_bytes):
+    """Convert bytes into a readable file size."""
+    size = float(size_bytes)
+
+    for unit in ("B", "KB", "MB", "GB", "TB"):
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
+
     return f"{size:.2f} PB"
 
 
-def format_duration(seconds):
-    """Convert duration from seconds to HH:MM:SS."""
+def format_duration(value):
+    """Convert duration in seconds to HH:MM:SS."""
     try:
-        seconds = float(seconds)
+        seconds = float(value)
+        if seconds < 0:
+            return "Not Available"
+
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
-        seconds = seconds % 60
-        return f"{hours:02}:{minutes:02}:{seconds:06.3f}"
+        remaining = seconds % 60
+
+        return f"{hours:02}:{minutes:02}:{remaining:06.3f}"
+
     except (ValueError, TypeError):
         return "Not Available"
 
 
-def check_ffprobe():
-    """Check whether FFprobe is installed."""
-    return shutil.which("ffprobe") is not None
+def get_field(data, key):
+    """Return a metadata value or a fallback."""
+    value = data.get(key)
+    return value if value not in (None, "") else "Not Available"
 
 
-def get_video_metadata(video_path):
-    """Extract video metadata using FFprobe."""
+def show_field(label, value):
+    """Print a consistently aligned report field."""
+    if value is None or value == "":
+        value = "Not Available"
+
+    print(f"{label:<22} : {value}")
+
+
+def show_heading(title):
+    print(f"\n{'-' * 46}")
+    print(f"{title}")
+    print("-" * 46)
+
+
+def convert_bitrate(value):
+    """Convert bits per second to kilobits per second."""
+    try:
+        return f"{int(value) / 1000:.2f} kbps"
+    except (ValueError, TypeError):
+        return "Not Available"
+
+
+def calculate_fps(value):
+    """Calculate frames per second from a fraction."""
+    try:
+        numerator, denominator = value.split("/")
+        denominator = float(denominator)
+
+        if denominator == 0:
+            return "Not Available"
+
+        return f"{float(numerator) / denominator:.2f} fps"
+
+    except (ValueError, TypeError, AttributeError):
+        return "Not Available"
+
+
+def read_video_info(file_path):
+    """Extract media details using FFprobe."""
     command = [
         "ffprobe",
-        "-v",
-        "quiet",
-        "-print_format",
-        "json",
+        "-v", "error",
+        "-print_format", "json",
         "-show_format",
         "-show_streams",
-        video_path
+        str(file_path)
     ]
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False
+    )
+
     if result.returncode != 0:
-        raise Exception(result.stderr)
+        raise RuntimeError(
+            result.stderr.strip() or "FFprobe could not read this file."
+        )
+
     return json.loads(result.stdout)
 
 
-def get_streams(streams):
-    """Find and return video and audio streams."""
-    video_stream = None
-    audio_stream = None
+def separate_streams(streams):
+    """Identify the first video and audio streams."""
+    video = None
+    audio = None
+
     for stream in streams:
-        if stream.get("codec_type") == "video" and video_stream is None:
-            video_stream = stream
-        elif stream.get("codec_type") == "audio" and audio_stream is None:
-            audio_stream = stream
-    return video_stream, audio_stream
+        stream_type = stream.get("codec_type")
+
+        if stream_type == "video" and video is None:
+            video = stream
+        elif stream_type == "audio" and audio is None:
+            audio = stream
+
+    return video, audio
 
 
-def print_tag(label, value):
-    """Print metadata in a formatted way."""
-    if value is None or value == "":
-        value = "Not Available"
-    print(f"{label:<20}: {value}")
+def print_tags(title, tags):
+    """Display available metadata tags."""
+    show_heading(title)
 
-
-def print_tags(tags):
-    """Print all available metadata tags."""
     if not tags:
-        print("No additional metadata available.")
+        print("No metadata tags available.")
         return
-    for key, value in tags.items():
-        print(f"{key:<25}: {value}")
+
+    for key, value in sorted(tags.items()):
+        show_field(str(key).replace("_", " ").title(), value)
 
 
-def analyze_video(video_path):
-    """Analyze a video file and generate metadata report."""
-    if not os.path.exists(video_path):
-        print("\nError: Video file not found.")
+def analyze_video(file_name):
+    """Generate a report for a video or media file."""
+    path = Path(file_name).expanduser()
+
+    if not path.exists():
+        print("\nError: The specified file does not exist.")
         return
-    if not os.path.isfile(video_path):
-        print("\nError: Provided path is not a file.")
+
+    if not path.is_file():
+        print("\nError: Please provide a file path, not a folder.")
         return
-    if not check_ffprobe():
-        print("\nError: FFprobe is not installed or not added to PATH.")
-        print("Please install FFmpeg first.")
+
+    if shutil.which("ffprobe") is None:
+        print("\nError: FFprobe is not installed or not in PATH.")
+        print("Please install FFmpeg and restart your terminal.")
         return
 
     try:
-        metadata = get_video_metadata(video_path)
-        file_path = Path(video_path)
-        file_size = os.path.getsize(video_path)
+        metadata = read_video_info(path)
 
-        format_data = metadata.get("format", {})
+        file_info = metadata.get("format", {})
         streams = metadata.get("streams", [])
+        video, audio = separate_streams(streams)
 
-        video_stream, audio_stream = get_streams(streams)
+        if video is None:
+            print("\nError: No video stream was found in this file.")
+            return
 
-        print()
-        print("=" * 40)
-        print("VIDEO METADATA REPORT")
-        print("=" * 40)
+        print("\n" + "=" * 46)
+        print("          VIDEO INSPECTION REPORT")
+        print("=" * 46)
 
-        # Basic File Information
-        print("\nBasic Information")
-        print("-" * 40)
-        print_tag("File Name", file_path.name)
-        print_tag("File Extension", file_path.suffix.upper())
-        print_tag("File Size", format_file_size(file_size))
+        # File details
+        show_heading("1. FILE INFORMATION")
+        show_field("File Name", path.name)
+        show_field("File Extension", path.suffix.upper() or "None")
+        show_field("File Size", format_size(path.stat().st_size))
 
-        # Format Information
-        print("\nFormat Information")
-        print("-" * 40)
-        print_tag("File Format", format_data.get("format_long_name"))
-        print_tag("Format Name", format_data.get("format_name"))
-        print_tag("Duration", format_duration(format_data.get("duration")))
-        print_tag("Bit Rate", f"{int(format_data.get('bit_rate')) / 1000:.2f} kbps" if format_data.get("bit_rate") else "Not Available")
-        print_tag("Start Time", format_data.get("start_time"))
+        # Container details
+        show_heading("2. CONTAINER INFORMATION")
+        show_field("Format", get_field(file_info, "format_long_name"))
+        show_field("Format Identifier", get_field(file_info, "format_name"))
+        show_field(
+            "Duration",
+            format_duration(file_info.get("duration"))
+        )
+        show_field(
+            "Overall Bitrate",
+            convert_bitrate(file_info.get("bit_rate"))
+        )
+        show_field("Start Time", get_field(file_info, "start_time"))
 
-        # Video Stream Information
-        print("\nVideo Properties")
-        print("-" * 40)
-        if video_stream:
-            print_tag("Codec", video_stream.get("codec_long_name"))
-            print_tag("Codec Name", video_stream.get("codec_name"))
-            print_tag("Resolution", f"{video_stream.get('width')}x{video_stream.get('height')}" if video_stream.get("width") and video_stream.get("height") else "Not Available")
-            
-            fps = video_stream.get("avg_frame_rate")
-            if fps and "/" in fps:
-                num, den = fps.split("/")
-                if den != "0":
-                    fps = f"{float(num) / float(den):.2f} fps"
-                else:
-                    fps = "Not Available"
-            print_tag("Frame Rate", fps)
-            
-            print_tag("Bit Rate", f"{int(video_stream.get('bit_rate')) / 1000:.2f} kbps" if video_stream.get("bit_rate") else "Not Available")
-            print_tag("Display Aspect", video_stream.get("display_aspect_ratio"))
-            print_tag("Pixel Format", video_stream.get("pix_fmt"))
+        # Video details
+        show_heading("3. VIDEO STREAM DETAILS")
+        show_field("Video Codec", get_field(video, "codec_long_name"))
+        show_field("Codec Identifier", get_field(video, "codec_name"))
+
+        width = video.get("width")
+        height = video.get("height")
+
+        resolution = (
+            f"{width} x {height}"
+            if width and height
+            else "Not Available"
+        )
+        show_field("Resolution", resolution)
+
+        show_field(
+            "Frame Rate",
+            calculate_fps(video.get("avg_frame_rate"))
+        )
+        show_field("Video Bitrate", convert_bitrate(video.get("bit_rate")))
+        show_field(
+            "Display Aspect Ratio",
+            get_field(video, "display_aspect_ratio")
+        )
+        show_field("Pixel Format", get_field(video, "pix_fmt"))
+        show_field("Pixel Format Profile", get_field(video, "profile"))
+
+        # Audio details
+        show_heading("4. AUDIO STREAM DETAILS")
+
+        if audio:
+            show_field("Audio Codec", get_field(audio, "codec_long_name"))
+            show_field("Codec Identifier", get_field(audio, "codec_name"))
+
+            rate = audio.get("sample_rate")
+            show_field(
+                "Sample Rate",
+                f"{rate} Hz" if rate else "Not Available"
+            )
+            show_field("Channels", get_field(audio, "channels"))
+            show_field("Channel Layout", get_field(audio, "channel_layout"))
+            show_field("Sample Format", get_field(audio, "sample_fmt"))
+            show_field("Audio Bitrate", convert_bitrate(audio.get("bit_rate")))
         else:
-            print("No video stream found.")
+            print("No audio stream is present.")
 
-        # Audio Stream Information
-        print("\nAudio Properties")
-        print("-" * 40)
-        if audio_stream:
-            print_tag("Codec", audio_stream.get("codec_long_name"))
-            print_tag("Codec Name", audio_stream.get("codec_name"))
-            print_tag("Sample Rate", f"{audio_stream.get('sample_rate')} Hz" if audio_stream.get("sample_rate") else "Not Available")
-            print_tag("Channels", audio_stream.get("channels"))
-            print_tag("Channel Layout", audio_stream.get("channel_layout"))
-            print_tag("Sample Format", audio_stream.get("sample_fmt"))
-            print_tag("Bit Rate", f"{int(audio_stream.get('bit_rate')) / 1000:.2f} kbps" if audio_stream.get("bit_rate") else "Not Available")
-        else:
-            print("No audio stream found.")
+        # Metadata tags
+        print_tags("5. FILE METADATA", file_info.get("tags", {}))
 
-        # Metadata Tags
-        print("\nVideo Metadata / Tags")
-        print("-" * 40)
-        format_tags = format_data.get("tags", {})
-        print_tags(format_tags)
+        if video.get("tags"):
+            print_tags("6. VIDEO STREAM METADATA", video["tags"])
 
-        print("\n" + "=" * 40)
-        print("REPORT COMPLETED")
-        print("=" * 40)
+        print("\n" + "=" * 46)
+        print("          REPORT GENERATED")
+        print("=" * 46)
 
-    except Exception as error:
-        print(f"\nError while processing video: {error}")
+    except subprocess.TimeoutExpired:
+        print("\nError: Analysis timed out after 60 seconds.")
+    except (OSError, RuntimeError, json.JSONDecodeError) as error:
+        print(f"\nError while analyzing the video: {error}")
 
 
 def main():
-    print("=" * 40)
-    print("VIDEO FILE ANALYZER")
-    print("=" * 40)
+    print("\n" + "*" * 46)
+    print("          VIDEO FILE INSPECTOR")
+    print("*" * 46)
+    print("Enter the complete path to your video file.")
 
-    video_path = "/Users/sachinyaduwanshi/Desktop/mm_lab/Multimedia-Systems-Lab/Cluster04-Video-Processing/video.mp4"
+    file_name = input("Video path: ").strip().strip('"').strip("'")
 
-    # Remove quotes if user copies a path with quotes
-    video_path = video_path.strip('"').strip("'")
+    if not file_name:
+        print("No file path entered.")
+        return
 
-    analyze_video(video_path)
+    analyze_video(file_name)
 
 
 if __name__ == "__main__":

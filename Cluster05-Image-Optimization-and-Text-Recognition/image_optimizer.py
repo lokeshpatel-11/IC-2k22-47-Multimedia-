@@ -1,150 +1,373 @@
-import os
+from pathlib import Path
+
 import cv2
-import numpy as np
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
-def optimize_image(input_path, output_path=None, max_width=1920, max_height=1080, quality=75, format="WebP"):
-    """
-    Optimizes an image by resizing, compressing, and removing unnecessary metadata.
-    """
-    if not os.path.exists(input_path):
-        print(f"Error: Could not find image at {input_path}")
-        return
 
-    # Original size in KB
-    original_size_kb = os.path.getsize(input_path) / 1024
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
-    print(f"\n--- Original Image Stats ---")
-    print(f"Path: {input_path}")
-    print(f"File Size: {original_size_kb:.2f} KB")
+TESSERACT_EXE = r"E:\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
 
-    try:
-        # 1. Open the image
-        img = Image.open(input_path)
-        
-        # Strip metadata by pasting into a new image
-        image_without_exif = Image.new(img.mode, img.size)
-        image_without_exif.paste(img)
-        img = image_without_exif
+# Save output in the same folder as this Python script.
+REPOSITORY_FOLDER = Path(__file__).resolve().parent
 
-        print(f"Dimensions: {img.size[0]}x{img.size[1]}")
 
-        # 2. Check dimensions & Resize if necessary
-        # We use LANCZOS for high quality downsampling
-        img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-        print(f"New Dimensions after resize: {img.size[0]}x{img.size[1]}")
+# =========================================================
+# CHECK TESSERACT
+# =========================================================
 
-        # 3. Determine output format and path
-        if not output_path:
-            filename, _ = os.path.splitext(input_path)
-            output_path = f"{filename}_optimized.{format.lower()}"
-
-        # 4. Save with Compression
-        if img.mode in ("RGBA", "P") and format.upper() == "JPEG":
-            # JPEG doesn't support alpha channel, convert to RGB
-            img = img.convert("RGB")
-
-        print(f"\n[Processing...] Saving as {format.upper()} with Quality={quality}...")
-        
-        img.save(output_path, format=format, quality=quality, optimize=True)
-
-        # 5. Output comparison
-        optimized_size_kb = os.path.getsize(output_path) / 1024
-        saved_kb = original_size_kb - optimized_size_kb
-        saved_percent = (saved_kb / original_size_kb) * 100
-
-        print(f"\n--- Optimized Image Stats ---")
-        print(f"Path: {output_path}")
-        print(f"New File Size: {optimized_size_kb:.2f} KB")
-        print(f"Saved: {saved_kb:.2f} KB ({saved_percent:.2f}% reduction)")
-        print("-" * 30)
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-def recognize_text(image_path):
-    """
-    Extracts text from an image using robust OCR preprocessing techniques.
-    Handles blur, noise, and high contrast conditions.
-    """
-    print("\n--- Text Recognition (OCR) ---")
-    if not os.path.exists(image_path):
-        print(f"Error: Could not find image at {image_path}")
-        return
+def check_tesseract():
+    if not Path(TESSERACT_EXE).is_file():
+        print("ERROR: Tesseract not found:", TESSERACT_EXE)
+        return False
 
     try:
-        # Load image using OpenCV
-        img = cv2.imread(image_path)
-        if img is None:
-            print("Failed to load image for OCR.")
-            return
+        languages = pytesseract.get_languages(config="")
+        if "eng" not in languages:
+            print("ERROR: English OCR language data is missing.")
+            return False
+        return True
+    except Exception as error:
+        print("Tesseract check failed:", error)
+        return False
 
-        # 1. Convert to Grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # 2. Rescale the image (improves OCR accuracy for smaller texts)
-        gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-        
-        # 3. Denoising/Blurring to handle noisy or blurry backgrounds
-        # Bilateral filter keeps edges sharp while removing noise
-        blur = cv2.bilateralFilter(gray, 9, 75, 75)
-        
-        # 4. Adaptive Thresholding to handle varying lighting/contrast
-        thresh = cv2.adaptiveThreshold(
-            blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2
+
+# =========================================================
+# GET OPTIMIZED IMAGE NAME AND FORMAT
+# =========================================================
+
+def get_output_image_path():
+    image_name = input(
+        "\nEnter the optimized image name (without extension): "
+    ).strip()
+
+    if not image_name:
+        print("ERROR: Image name cannot be empty.")
+        return None
+
+    # Prevent a path or folder from being entered as the name.
+    if Path(image_name).name != image_name or "/" in image_name or "\\" in image_name:
+        print("ERROR: Enter only a filename, not a path.")
+        return None
+
+    print("\nChoose output image format:")
+    print("1. WebP")
+    print("2. JPEG")
+    print("3. PNG")
+
+    format_choice = input("Enter your choice (1-3): ").strip()
+
+    formats = {
+        "1": (".webp", "WEBP"),
+        "2": (".jpg", "JPEG"),
+        "3": (".png", "PNG"),
+    }
+
+    if format_choice not in formats:
+        print("ERROR: Invalid format choice.")
+        return None
+
+    extension, image_format = formats[format_choice]
+
+    # Remove a supported extension if the user typed one anyway.
+    supplied_path = Path(image_name)
+    if supplied_path.suffix.lower() in (".webp", ".jpg", ".jpeg", ".png"):
+        image_name = supplied_path.stem
+
+    if not image_name:
+        print("ERROR: Invalid image name.")
+        return None
+
+    destination = REPOSITORY_FOLDER / (image_name + extension)
+    return destination, image_format
+
+
+# =========================================================
+# IMAGE OPTIMIZATION
+# =========================================================
+
+def optimize_image(image_path=None):
+    if image_path is None:
+        image_path = input(
+            "\nEnter the full path of the original image: "
+        ).strip().strip('"')
+
+    source = Path(image_path)
+
+    if not source.is_file():
+        print("ERROR: Image file not found:", source)
+        return None
+
+    output = get_output_image_path()
+
+    if output is None:
+        return None
+
+    destination, image_format = output
+
+    # Avoid accidentally overwriting the original image.
+    try:
+        if source.resolve() == destination.resolve():
+            print("ERROR: Output name matches the original image.")
+            print("Choose a different optimized image name.")
+            return None
+    except OSError:
+        pass
+
+    try:
+        with Image.open(source) as original:
+            image = ImageOps.exif_transpose(original).copy()
+
+        print("\nOriginal dimensions:", image.size)
+        print(f"Original size: {source.stat().st_size:,} bytes")
+
+        # Resize only if larger than the maximum dimensions.
+        image.thumbnail(
+            (1920, 1080),
+            Image.Resampling.LANCZOS
         )
-        
-        print("Extracting text...")
-        # Page segmentation mode 6 assumes a single uniform block of text
-        custom_config = r'--oem 3 --psm 6'
-        text = pytesseract.image_to_string(thresh, config=custom_config)
-        
-        if text.strip():
-            print("\nExtracted Text:\n")
-            print("-" * 40)
-            print(text.strip())
-            print("-" * 40)
-        else:
-            print("\nNo text could be extracted from the image.")
-            
-    except Exception as e:
-        print(f"An error occurred during text recognition: {e}")
-        print("Note: Ensure 'tesseract' is installed on your system (e.g., 'brew install tesseract').")
+
+        # Apply mild contrast and sharpness enhancement.
+        image = ImageEnhance.Contrast(image).enhance(1.05)
+        image = ImageEnhance.Sharpness(image).enhance(1.10)
+        image = image.filter(
+            ImageFilter.UnsharpMask(
+                radius=1,
+                percent=110,
+                threshold=3
+            )
+        )
+
+        REPOSITORY_FOLDER.mkdir(parents=True, exist_ok=True)
+
+        if image_format == "JPEG":
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+
+            image.save(
+                destination,
+                "JPEG",
+                quality=85,
+                optimize=True
+            )
+
+        elif image_format == "PNG":
+            image.save(
+                destination,
+                "PNG",
+                optimize=True
+            )
+
+        elif image_format == "WEBP":
+            if image.mode not in ("RGB", "RGBA"):
+                image = image.convert("RGB")
+
+            image.save(
+                destination,
+                "WEBP",
+                quality=85,
+                method=6
+            )
+
+        print("\nImage optimization completed!")
+        print("Saved image:", destination)
+        print("Output dimensions:", image.size)
+        print(f"Output size: {destination.stat().st_size:,} bytes")
+
+        return str(destination)
+
+    except Exception as error:
+        print("Image optimization failed:", error)
+        return None
+
+
+# =========================================================
+# TEXT RECOGNITION (OCR)
+# =========================================================
+
+def extract_text(image_path=None):
+    if not check_tesseract():
+        return None
+
+    if image_path is None:
+        image_path = input(
+            "\nEnter the full path of the image to read: "
+        ).strip().strip('"')
+
+    source = Path(image_path)
+
+    if not source.is_file():
+        print("ERROR: Image file not found:", source)
+        return None
+
+    try:
+        image = cv2.imread(str(source))
+
+        if image is None:
+            print("ERROR: Could not open image:", source)
+            return None
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # Enlarge small images to improve recognition.
+        height, width = gray.shape
+
+        if width < 1600:
+            scale = 1600 / width
+            gray = cv2.resize(
+                gray,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC
+            )
+
+        threshold = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
+
+        print("\nReading text from image...")
+
+        # PSM 8 worked best for your test image.
+        attempts = [
+            ("Grayscale", gray),
+            ("Otsu threshold", threshold)
+        ]
+
+        results = []
+
+        for method_name, processed in attempts:
+            text = pytesseract.image_to_string(
+                processed,
+                lang="eng",
+                config="--oem 3 --psm 8"
+            ).strip()
+
+            if text:
+                results.append((method_name, text))
+
+        if not results:
+            print("No text detected in this image.")
+            return None
+
+        method_name, recognized_text = results[0]
+
+        print(f"\n--- OCR Results ({method_name}) ---")
+        print(recognized_text)
+
+        if len(results) > 1 and results[1][1] != recognized_text:
+            print("\nAlternative OCR result:")
+            print(results[1][1])
+
+        return recognized_text
+
+    except Exception as error:
+        print("Text extraction failed:", error)
+        return None
+
+
+# =========================================================
+# COMBINED: OPTIMIZE IMAGE AND EXTRACT TEXT
+# =========================================================
+
+def optimize_and_extract():
+    image_path = input(
+        "\nEnter the full path of the original image: "
+    ).strip().strip('"')
+
+    optimized_path = optimize_image(image_path)
+
+    if optimized_path is None:
+        print("Combined operation stopped because optimization failed.")
+        return
+
+    print("\n" + "=" * 45)
+    print("EXTRACTING TEXT FROM OPTIMIZED IMAGE")
+    print("=" * 45)
+
+    recognized_text = extract_text(optimized_path)
+
+    if recognized_text:
+        save_choice = input(
+            "\nSave extracted text to a .txt file? (y/n): "
+        ).strip().lower()
+
+        if save_choice == "y":
+            output_name = input(
+                "Enter the text filename (without extension): "
+            ).strip()
+
+            if (
+                not output_name
+                or Path(output_name).name != output_name
+                or "/" in output_name
+                or "\\" in output_name
+            ):
+                print("ERROR: Enter a valid filename only.")
+                return
+
+            # Ensure the .txt extension is added only once.
+            if output_name.lower().endswith(".txt"):
+                output_name = output_name[:-4]
+
+            if not output_name:
+                print("ERROR: Invalid text filename.")
+                return
+
+            destination = REPOSITORY_FOLDER / (output_name + ".txt")
+
+            try:
+                destination.write_text(
+                    recognized_text,
+                    encoding="utf-8"
+                )
+                print("Extracted text saved to:", destination)
+
+            except Exception as error:
+                print("Could not save text:", error)
+
+
+# =========================================================
+# MAIN MENU
+# =========================================================
 
 def main():
     print("=" * 50)
-    print("IMAGE OPTIMIZATION & TEXT RECOGNITION TOOL")
+    print("    IMAGE OPTIMIZER AND TEXT RECOGNITION")
     print("=" * 50)
 
-    input_img = input("Enter the path to your image:\n> ").strip()
-    
-    # Remove quotes if user drag-drops the file in terminal
-    input_img = input_img.strip('"').strip("'")
+    while True:
+        print("\nChoose an option:")
+        print("1. Optimize an image")
+        print("2. Extract text from an image (OCR)")
+        print("3. Optimize Image and Extract Text")
+        print("4. Exit")
 
-    if not input_img:
-        print("Path is required! Exiting...")
-        return
-        
-    print("\nSelect an action:")
-    print("1. Optimize Image (Resize, Format, Compress)")
-    print("2. Recognize Text (OCR with preprocessing)")
-    print("3. Do Both (Optimize & Extract Text)")
-    
-    action = input("Enter choice (1/2/3): ").strip()
-    
-    if action in ["1", "3"]:
-        print("\n[Optimization Settings]")
-        choice = input("Format (1: WebP, 2: JPEG, 3: PNG) [Default=1]: ").strip()
-        fmt = "JPEG" if choice == "2" else ("PNG" if choice == "3" else "WebP")
-        
-        quality_input = input("Compression quality (1-100) [Default=75]: ").strip()
-        quality = int(quality_input) if quality_input.isdigit() else 75
+        choice = input("\nEnter your choice (1-4): ").strip()
 
-        optimize_image(input_img, quality=quality, format=fmt)
-        
-    if action in ["2", "3"]:
-        recognize_text(input_img)
+        if choice == "1":
+            optimize_image()
+
+        elif choice == "2":
+            extract_text()
+
+        elif choice == "3":
+            optimize_and_extract()
+
+        elif choice == "4":
+            print("Program closed.")
+            break
+
+        else:
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
+
 
 if __name__ == "__main__":
     main()
